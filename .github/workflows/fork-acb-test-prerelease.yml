@@ -1,0 +1,198 @@
+name: Fork-only ACB banknote compatibility test prerelease
+
+on:
+  push:
+    branches:
+      - 'release/acb-note-test-20261113'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: vault2-acb-test-prerelease
+  cancel-in-progress: false
+
+jobs:
+  verify-and-publish:
+    if: github.repository == 'wickidcow/Vault2.0'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      TEST_TAG: v2.1.2-wickidcow-acb-test.1
+    steps:
+      - name: Check out exact fork source
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Verify fork-only release identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "${GITHUB_REPOSITORY}" = "wickidcow/Vault2.0"
+          test "${GITHUB_REF}" = "refs/heads/release/acb-note-test-20261113"
+          test "$(git rev-parse HEAD)" = "${GITHUB_SHA}"
+          grep -Fq '<version>2.1.2</version>' pom.xml
+          grep -Fq 'version: 2.1.2' src/main/resources/plugin.yml
+          test -f src/test/java/com/example/vault/economy/PhysicalNoteCandidateTest.java
+      - name: Set up Java 17 for legacy plugin build and tests
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+      - name: Verify Java 17 legacy build and six real JUnit regressions
+        run: mvn -B -Plegacy verify
+      - name: Check Java 17 JUnit results before continuing
+        run: python3 - <<'PY'
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+          reports = list(Path("target-java17/surefire-reports").glob("TEST-*.xml"))
+          matching = [ET.parse(f).getroot() for f in reports
+                      if "PhysicalNoteCandidateTest" in f.name]
+          if len(matching) != 1:
+              raise SystemExit(f"Expected exactly one legacy banknote test suite, got {len(matching)}")
+          suite = matching[0]
+          if any(int(suite.get(key, "-1")) != value for key, value in
+                 {"tests": 6, "errors": 0, "failures": 0, "skipped": 0}.items()):
+              raise SystemExit(f"Java 17 banknote regressions failed: {suite.attrib}")
+          print("Verified Java 17: six banknote regression tests passed")
+          PY
+      - name: Set up Java 21 for modern plugin build and tests
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+      - name: Verify Java 21 modern build and six real JUnit regressions
+        run: mvn -B -Pmodern verify
+      - name: Check Java 21 JUnit results and stage both original raw JARs
+        run: python3 - <<'PY'
+          from pathlib import Path
+          import hashlib
+          from zipfile import ZipFile
+          import xml.etree.ElementTree as ET
+
+          modern_reports = list(Path("target-java21/surefire-reports").glob("TEST-*.xml"))
+          matching = [ET.parse(f).getroot() for f in modern_reports
+                      if "PhysicalNoteCandidateTest" in f.name]
+          if len(matching) != 1:
+              raise SystemExit(f"Expected exactly one modern banknote test suite, got {len(matching)}")
+          suite = matching[0]
+          if any(int(suite.get(key, "-1")) != value for key, value in
+                 {"tests": 6, "errors": 0, "failures": 0, "skipped": 0}.items()):
+              raise SystemExit(f"Java 21 banknote regressions failed: {suite.attrib}")
+
+          dest = Path("dist")
+          dest.mkdir(exist_ok=False)
+          digests = []
+          for profile, directory in (("java17", "target-java17"), ("java21", "target-java21")):
+              built = Path(directory) / f"vault-2.1.2-{profile}.jar"
+              if not built.is_file() or built.is_symlink() or built.stat().st_size < 10000:
+                  raise SystemExit(f"Missing verified original raw JAR: {built}")
+              with ZipFile(built) as jar:
+                  if jar.testzip() is not None:
+                      raise SystemExit(f"Bad JAR CRC: {built}")
+                  names = jar.namelist()
+                  if len(names) != len(set(names)) or any(n.startswith("/") or ".." in Path(n).parts for n in names):
+                      raise SystemExit(f"Unsafe/duplicate JAR entries: {built}")
+                  if "version: 2.1.2" not in jar.read("plugin.yml").decode():
+                      raise SystemExit(f"Unrecognized Vault plugin version: {built}")
+                  for required in ("com/example/vault/economy/PhysicalNoteService.class",
+                                   "com/example/vault/economy/PhysicalNoteCandidate.class"):
+                      if required not in names:
+                          raise SystemExit(f"Missing patch class {required}: {built}")
+              raw = built.read_bytes()
+              filename = f"Vault2.0-2.1.2-wickidcow-ACB-TEST-{profile}.jar"
+              output = dest / filename
+              output.write_bytes(raw)
+              if output.read_bytes() != raw:
+                  raise SystemExit("Plugin JAR changed while staging")
+              digests.append(f"{hashlib.sha256(raw).hexdigest()}  {filename}")
+          (dest / "SHA256SUMS.txt").write_text("\n".join(digests) + "\n")
+          print("Verified modern tests and staged both byte-for-byte plugin JARs:\n" +
+                "\n".join(digests))
+          PY
+      - name: Retain exact downloadable CI test outputs
+        uses: actions/upload-artifact@v4
+        with:
+          name: Vault2.0-ACB-compatibility-verified-test-JARs
+          path: dist/*
+          if-no-files-found: error
+      - name: Create NEW immutable fork-only prerelease with both tested JARs
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if gh release view "${TEST_TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            echo "Refusing to replace an existing release: ${TEST_TAG}" >&2
+            exit 1
+          fi
+          if git ls-remote --exit-code --tags origin "refs/tags/${TEST_TAG}" >/dev/null 2>&1; then
+            echo "Refusing to reuse an existing tag: ${TEST_TAG}" >&2
+            exit 1
+          fi
+          cat > release-notes.md <<'EOF'
+          ## Vault2.0 2.1.2 — ACB Upgrade Card compatibility test (fork prerelease)
+
+          **TEST BUILD ONLY.** This is a fork-only prerelease based on Vault2.0 2.1.2;
+          it has **not** been accepted or released by the upstream Vault2.0 maintainer.
+
+          Fixes a false-positive physical-banknote warning when right-clicking with
+          custom PAPER items such as FluffyMachines' ACB Upgrade Card. Unrelated
+          paper items no longer trigger Vault's counterfeit-note detection solely
+          because their lore mentions "right-click". Recognized banknotes still
+          require their existing HMAC validation; no bank balance, player item,
+          redeemed-note record, signing secret, or Slimefun metadata is changed.
+
+          - `Vault2.0-2.1.2-wickidcow-ACB-TEST-java21.jar` — Java 21+ servers,
+            including modern Paper/Purpur 26.2–26.3 (recommended test candidate).
+          - `Vault2.0-2.1.2-wickidcow-ACB-TEST-java17.jar` — Java 17+
+            legacy compatibility build.
+          - `SHA256SUMS.txt` — SHA-256 digests for both unmodified JAR files.
+
+          **Verification:** Six source-level banknote regression tests passed in
+          each of the Java 17 and Java 21 Maven builds. An actual player/ACB
+          interaction and banknote redemption on the reporter's exact server
+          remain to be tested; no live-gameplay result is implied.
+
+          **Test on a disposable server first.** Back up Vault's entire plugin
+          data directory, including `.note-secret.dat` and redeemed-note/balance
+          files, without changing them. Stop the test server and replace the
+          existing Vault2.0 JAR; do not install alongside original `Vault.jar`
+          (both plugins register the name `Vault`). With an existing ACB
+          Upgrade Card, right-click once: verify the bench tier increases by
+          exactly one, the card count decreases by exactly one, and no Vault
+          forged-note warning appears. Also verify that previously valid signed
+          Vault notes still redeem, and tampered/redeemed notes remain rejected.
+
+          Context: https://github.com/wickidcow/Slimefun-Legacy/issues/604
+          Fork fix: https://github.com/wickidcow/Vault2.0/pull/1
+          EOF
+          gh release create "${TEST_TAG}" dist/*.jar dist/SHA256SUMS.txt \
+            --repo "${GITHUB_REPOSITORY}" --target "${GITHUB_SHA}" \
+            --prerelease --title "Vault2.0 2.1.2 — ACB compatibility TEST 1 (fork)" \
+            --notes-file release-notes.md
+      - name: Confirm exact prerelease tag and all three uploaded assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release view "${TEST_TAG}" --repo "${GITHUB_REPOSITORY}" \
+            --json tagName,isPrerelease,assets,targetCommitish \
+            | python3 -c '
+          import json, os, sys
+          data = json.load(sys.stdin)
+          expected = {
+            "Vault2.0-2.1.2-wickidcow-ACB-TEST-java17.jar",
+            "Vault2.0-2.1.2-wickidcow-ACB-TEST-java21.jar",
+            "SHA256SUMS.txt",
+          }
+          got = {asset["name"] for asset in data["assets"]}
+          assert data["tagName"] == os.environ["TEST_TAG"] and data["isPrerelease"], data
+          assert data["targetCommitish"] == os.environ["GITHUB_SHA"], data
+          assert got == expected, (got, expected)
+          assert all(asset["size"] > 0 for asset in data["assets"]), data
+          print("Verified fork-only test prerelease with both raw JARs and checksums")
+          '
