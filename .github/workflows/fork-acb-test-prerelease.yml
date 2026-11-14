@@ -43,7 +43,8 @@ jobs:
       - name: Verify Java 17 legacy build and six real JUnit regressions
         run: mvn -B -Plegacy verify
       - name: Check Java 17 JUnit results before continuing
-        run: python3 - <<'PY'
+        run: |
+          python3 - <<'PY'
           from pathlib import Path
           import xml.etree.ElementTree as ET
           reports = list(Path("target-java17/surefire-reports").glob("TEST-*.xml"))
@@ -66,7 +67,8 @@ jobs:
       - name: Verify Java 21 modern build and six real JUnit regressions
         run: mvn -B -Pmodern verify
       - name: Check Java 21 JUnit results and stage both original raw JARs
-        run: python3 - <<'PY'
+        run: |
+          python3 - <<'PY'
           from pathlib import Path
           import hashlib
           from zipfile import ZipFile
